@@ -741,7 +741,7 @@ it.each([
         );
       },
       processIdentities: async (rows) =>
-        new Map(
+        new Map<number, ProcessIdentityObservation>(
           rows.map(({ pid }) => {
             if (tokenRead && observedAfterToken)
               return [
