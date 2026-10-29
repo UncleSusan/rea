@@ -726,27 +726,34 @@ it("refreshes a group when its last member exits during revalidation and a child
     state: "S",
     command: "child",
   };
-  let tokenReads = 0;
-  let launcherGone = false;
+  let planningTokenRead = false;
+  let phase: "planning" | "snapshot" | "after-snapshot" = "planning";
+  let refreshFoundChild = false;
   const signalGroup = vi.fn();
   const host: ProcessOwnershipHost = {
     platform: "linux",
-    listProcesses: async () => (launcherGone ? [child] : [launcher]),
-    environment: async (pid) => {
-      if (pid === launcher.pid) {
-        tokenReads += 1;
-        // The planning read still sees the launcher. The revalidation read is
-        // the final table, so the child appears only after that snapshot.
-        if (tokenReads >= 2) launcherGone = true;
-        if (launcherGone)
-          throw Object.assign(new Error("opaque exit"), { code: "ESRCH" });
+    listProcesses: async () => {
+      if (phase === "after-snapshot") {
+        refreshFoundChild = true;
+        return [child];
       }
+      // The snapshot under test is the table read after planning has already
+      // observed the launcher token. Earlier planning reads stay on the launcher.
+      if (planningTokenRead && phase === "planning") phase = "snapshot";
+      return [launcher];
+    },
+    environment: async (pid) => {
+      if (pid === launcher.pid && phase === "snapshot") {
+        phase = "after-snapshot";
+        throw Object.assign(new Error("opaque exit"), { code: "ESRCH" });
+      }
+      if (pid === launcher.pid) planningTokenRead = true;
       return { REA_PROCESS_RUN_ID: "run" };
     },
     processIdentities: async (rows) =>
       new Map<number, ProcessIdentityObservation>(
         rows.map(({ pid }) =>
-          pid === launcher.pid && launcherGone
+          pid === launcher.pid && phase === "after-snapshot"
             ? [
                 pid,
                 {
@@ -780,6 +787,7 @@ it("refreshes a group when its last member exits during revalidation and a child
       host,
     ),
   ).toEqual({ cleaned: true, signaled: true });
+  expect(refreshFoundChild).toBe(true);
   expect(signalGroup).toHaveBeenCalledWith(940, "SIGKILL");
 });
 
