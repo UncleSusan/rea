@@ -574,3 +574,70 @@ it("honors cancellation during token-open exit settlement", async () => {
     ),
   ).rejects.toThrow("cancelled");
 });
+
+it("does not signal a stale group after its last member exits during revalidation", async () => {
+  const row: ProcessTableEntry = {
+    pid: 912,
+    parentPid: 1,
+    processGroupId: 912,
+    state: "S",
+    command: "fixture",
+  };
+  let tokenReads = 0;
+  let laterReads = 0;
+  let absent = false;
+  const signalGroup = vi.fn();
+  const host: ProcessOwnershipHost = {
+    platform: "linux",
+    listProcesses: async () => (absent ? [] : [row]),
+    environment: async () => ({}),
+    runTokens: async (members) => {
+      tokenReads += 1;
+      return new Map(
+        members.map(({ pid }) => [
+          pid,
+          tokenReads === 1
+            ? { state: "readable" as const, runId: "run" }
+            : {
+                state: "unavailable" as const,
+                reason: "ESRCH: open /proc/912/environ",
+              },
+        ]),
+      );
+    },
+    processIdentities: async (members) =>
+      new Map<number, ProcessIdentityObservation>(
+        members.map(({ pid }) => {
+          if (tokenReads >= 2 && ++laterReads >= 3) {
+            absent = true;
+            return [
+              pid,
+              { state: "absent", reason: "not-found-in-caller-pid-namespace" },
+            ];
+          }
+          return [
+            pid,
+            {
+              state: "readable",
+              identity: "generation-912",
+              lifecycle: { state: "observed", lifecycle: "non-zombie" },
+              relation: {
+                state: "observed",
+                parentPid: 1,
+                processGroupId: 912,
+              },
+            },
+          ];
+        }),
+      ),
+    signalGroup,
+  };
+  expect(
+    await cleanupOwnedProcessGroup(
+      { runId: "run", leaderPid: 912, processGroupId: 912 },
+      host,
+    ),
+  ).toEqual({ cleaned: true, signaled: false });
+  expect(tokenReads).toBe(2);
+  expect(signalGroup).not.toHaveBeenCalled();
+});
