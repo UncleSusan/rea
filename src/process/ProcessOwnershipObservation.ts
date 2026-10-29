@@ -832,6 +832,68 @@ export const settleExitingProcessIdentities = async (
   return identities;
 };
 
+/** Corroborate Linux token-open exit races without granting signal authority. */
+export const settleVanishedTokenFacts = async (
+  facts: readonly ProcessOwnershipFact[],
+  host: ProcessOwnershipHost,
+  budget: ProcessExitSettlementBudget,
+  signal?: AbortSignal,
+): Promise<readonly ProcessOwnershipFact[]> => {
+  if ((host.platform ?? process.platform) !== "linux") return facts;
+  let pending = facts
+    .filter(
+      ({ token, identityAfter }) =>
+        token.state === "unavailable" &&
+        /^(?:ENOENT|ESRCH):/u.test(token.reason) &&
+        !processIdentityHasExited(identityAfter),
+    )
+    .map(({ process }) => process);
+  if (pending.length === 0) return facts;
+  let current = facts;
+  const deadline = (budget.deadline ??=
+    performance.now() + PROCESS_CLEANUP_VERIFICATION_GRACE_MS);
+  for (let attempt = 0; attempt < 4 && pending.length > 0; attempt += 1) {
+    signal?.throwIfAborted();
+    if (attempt > 0) {
+      const remaining = deadline - performance.now();
+      if (remaining <= 0) break;
+      await delay(
+        Math.min(40, remaining),
+        undefined,
+        signal === undefined ? undefined : { signal },
+      );
+    }
+    const confirmed = await readNativeProcessIdentityMap(pending, host, signal);
+    const pendingPids = new Set(pending.map(({ pid }) => pid));
+    const nextPending = new Set<number>();
+    current = current.map((fact) => {
+      if (!pendingPids.has(fact.process.pid)) return fact;
+      const after = confirmed.get(fact.process.pid);
+      if (after?.state === "absent")
+        return { ...fact, state: "absent" as const, identityAfter: after };
+      const previous = fact.identityAfter;
+      if (previous.state !== "readable" || after?.state !== "readable")
+        return fact;
+      if (previous.identity !== after.identity)
+        return {
+          ...fact,
+          state: "unavailable" as const,
+          identityAfter: {
+            state: "unavailable" as const,
+            reason: "process_identity_changed_during_final_token_exit_check",
+          },
+        };
+      if (processIdentityHasExited(after))
+        return { ...fact, identityAfter: after };
+      nextPending.add(fact.process.pid);
+      return fact;
+    });
+    pending = pending.filter(({ pid }) => nextPending.has(pid));
+  }
+  signal?.throwIfAborted();
+  return current;
+};
+
 /**
  * Read identity, token, then identity for caller-provided rows. This owner
  * never enumerates the process table; a token is tied to a generation only

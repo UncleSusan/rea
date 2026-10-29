@@ -8,6 +8,7 @@ import {
   readNativeProcessIdentityMap,
   readProcessOwnershipFacts,
   settleExitingProcessIdentities,
+  settleVanishedTokenFacts,
   systemProcessOwnershipHost as systemHost,
 } from "./ProcessOwnershipObservation.js";
 import { launcherIdentityFailure } from "./ProcessOwnershipIdentity.js";
@@ -1285,9 +1286,13 @@ const processOwnershipFailures = async (
 ): Promise<readonly ProcessOwnershipValidationFailure[]> => {
   const runId = ownership.runId;
   if (host.processIdentities !== undefined) {
-    const facts = await readProcessOwnershipFacts(members, host, undefined, {
+    const facts = await settleVanishedTokenFacts(
+      await readProcessOwnershipFacts(members, host, undefined, {
+        exitSettlement,
+      }),
+      host,
       exitSettlement,
-    });
+    );
     const failures: ProcessOwnershipValidationFailure[] = [];
     for (const fact of facts) {
       if (processIdentityHasExited(fact.identityAfter)) continue;
@@ -1675,58 +1680,8 @@ const scanWithOwnershipEvidence = async (
     facts = facts.map((fact) => retryByPid.get(fact.process.pid) ?? fact);
   }
 
-  // The final run-token retry can still race with exit after its last native
-  // identity read. Before classifying a live-token failure, corroborate
-  // ENOENT/ESRCH with a fresh native observation. A changed PID generation,
-  // even one already a zombie, is not evidence that the original is gone.
-  if ((host.platform ?? process.platform) === "linux") {
-    const vanishedTokenRows = facts
-      .filter(
-        ({ token, identityAfter }) =>
-          token.state === "unavailable" &&
-          /^(?:ENOENT|ESRCH):/u.test(token.reason) &&
-          !processIdentityHasExited(identityAfter),
-      )
-      .map(({ process }) => process);
-    // After a SIGKILL or cancellation, an environ-open ESRCH can precede
-    // visible native exit by a few scheduling ticks. Allow a small bounded
-    // native-only settlement window; never infer exit from the failed token.
-    // Still-live generations remain explicit cleanup failures.
-    let pending = vanishedTokenRows;
-    for (
-      let attempt = 0;
-      attempt < TOKEN_READ_RETRY_ATTEMPTS + 1 && pending.length > 0;
-      attempt += 1
-    ) {
-      if (attempt > 0) await delay(TOKEN_READ_RETRY_DELAY_MS);
-      const confirmed = await readNativeProcessIdentityMap(pending, host);
-      const pendingPids = new Set(pending.map(({ pid }) => pid));
-      const nextPending = new Set<number>();
-      facts = facts.map((fact) => {
-        if (!pendingPids.has(fact.process.pid)) return fact;
-        const after = confirmed.get(fact.process.pid);
-        if (after?.state === "absent")
-          return { ...fact, state: "absent" as const, identityAfter: after };
-        const previous = fact.identityAfter;
-        if (previous.state !== "readable" || after?.state !== "readable")
-          return fact;
-        if (previous.identity !== after.identity)
-          return {
-            ...fact,
-            state: "unavailable" as const,
-            identityAfter: {
-              state: "unavailable" as const,
-              reason: "process_identity_changed_during_final_token_exit_check",
-            },
-          };
-        if (processIdentityHasExited(after))
-          return { ...fact, identityAfter: after };
-        nextPending.add(fact.process.pid);
-        return fact;
-      });
-      pending = pending.filter(({ pid }) => nextPending.has(pid));
-    }
-  }
+  // Recheck final token-open races at the shared native identity boundary.
+  facts = await settleVanishedTokenFacts(facts, host, exitSettlement);
 
   const processGroupIds = new Set<number>([
     ...(relation === undefined ? [] : [relation.processGroupId]),

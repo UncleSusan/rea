@@ -12,6 +12,7 @@ import {
 import {
   createSystemProcessOwnershipHost,
   readProcessOwnershipFacts,
+  settleVanishedTokenFacts,
 } from "./ProcessOwnershipObservation.js";
 
 it.each(["zombie", "absent", "live", "unavailable"] as const)(
@@ -433,3 +434,143 @@ it.each([
     expect(host.signalGroup).not.toHaveBeenCalled();
   },
 );
+
+it.each(["absent", "live", "unavailable", "reused", "reused-zombie"] as const)(
+  "corroborates group token-open races without signaling %s",
+  async (outcome) => {
+    const row: ProcessTableEntry = {
+      pid: 910,
+      parentPid: 1,
+      processGroupId: 910,
+      state: "S",
+      command: "fixture",
+    };
+    let tokenRead = false;
+    let postTokenReads = 0;
+    let absent = false;
+    const signalGroup = vi.fn();
+    const host: ProcessOwnershipHost = {
+      platform: "linux",
+      listProcesses: async () => (absent ? [] : [row]),
+      environment: async () => ({}),
+      runTokens: async (members) => {
+        tokenRead = true;
+        return new Map(
+          members.map(({ pid }) => [
+            pid,
+            {
+              state: "unavailable" as const,
+              reason: "ESRCH: open /proc/910/environ",
+            },
+          ]),
+        );
+      },
+      processIdentities: async (members) =>
+        new Map<number, ProcessIdentityObservation>(
+          members.map(({ pid }) => {
+            const later = tokenRead && ++postTokenReads >= 3;
+            if (later && outcome === "absent") {
+              absent = true;
+              return [
+                pid,
+                {
+                  state: "absent" as const,
+                  reason: "not-found-in-caller-pid-namespace" as const,
+                },
+              ];
+            }
+            if (later && outcome === "unavailable") {
+              return [
+                pid,
+                { state: "unavailable" as const, reason: "identity denied" },
+              ];
+            }
+            return [
+              pid,
+              {
+                state: "readable" as const,
+                identity:
+                  later && outcome.startsWith("reused")
+                    ? "replacement"
+                    : "generation-910",
+                lifecycle: {
+                  state: "observed" as const,
+                  lifecycle:
+                    later && outcome === "reused-zombie"
+                      ? ("zombie" as const)
+                      : ("non-zombie" as const),
+                },
+                relation: {
+                  state: "observed" as const,
+                  parentPid: 1,
+                  processGroupId: 910,
+                },
+              },
+            ];
+          }),
+        ),
+      signalGroup,
+    };
+    const result = await cleanupOwnedProcessGroup(
+      { runId: "run", leaderPid: 910, processGroupId: 910 },
+      host,
+    );
+    if (outcome === "absent")
+      expect(result).toEqual({ cleaned: true, signaled: false });
+    else
+      expect(result).toMatchObject({
+        cleaned: false,
+        failures: [
+          {
+            pid: 910,
+            reason: outcome.startsWith("reused")
+              ? "process-identity-unavailable"
+              : "environment-unreadable",
+          },
+        ],
+      });
+    expect(signalGroup).not.toHaveBeenCalled();
+  },
+);
+
+it("honors cancellation during token-open exit settlement", async () => {
+  const row: ProcessTableEntry = {
+    pid: 911,
+    parentPid: 1,
+    processGroupId: 911,
+    state: "S",
+    command: "fixture",
+  };
+  const identity: ProcessIdentityObservation = {
+    state: "readable",
+    identity: "generation-911",
+    lifecycle: { state: "observed", lifecycle: "non-zombie" },
+  };
+  const controller = new AbortController();
+  const host: ProcessOwnershipHost = {
+    platform: "linux",
+    listProcesses: async () => [row],
+    environment: async () => ({}),
+    signalGroup: vi.fn(),
+    processIdentities: async () => {
+      controller.abort(new Error("cancelled"));
+      return new Map([[row.pid, identity]]);
+    },
+  };
+  await expect(
+    settleVanishedTokenFacts(
+      [
+        {
+          process: row,
+          state: "same-generation",
+          identityBefore: identity,
+          identityAfter: identity,
+          token: { state: "unavailable", reason: "ESRCH: vanished" },
+        },
+      ],
+      host,
+      { deadline: undefined },
+      controller.signal,
+    ),
+  ).rejects.toThrow("cancelled");
+});
