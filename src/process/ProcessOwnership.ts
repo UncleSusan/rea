@@ -1139,55 +1139,69 @@ const revalidateOwnedProcessGroup = async (
     }
   | ProcessCleanupResult
 > => {
-  let members: readonly ProcessTableEntry[];
-  let escapedProcessGroupIds: readonly number[] = [];
-  try {
-    const settled = await settleLauncherExit(
+  const escapedProcessGroupIds = new Set<number>();
+  for (let refresh = 0; ; refresh += 1) {
+    let members: readonly ProcessTableEntry[];
+    try {
+      const settled = await settleLauncherExit(
+        ownership,
+        liveProcesses(await host.listProcesses()),
+        host,
+        exitSettlement,
+      );
+      if ("cleaned" in settled) return settled;
+      for (const groupId of settled.escapedProcessGroupIds)
+        escapedProcessGroupIds.add(groupId);
+      const relationSnapshot = await readProcessRelationSnapshot(
+        ownership,
+        settled.processes,
+        host,
+      );
+      if (relationSnapshot.failures.length > 0)
+        return cleanupValidationFailure(relationSnapshot.failures);
+      members = relationSnapshot.currentRelations.filter(
+        ({ processGroupId: observedGroupId }) =>
+          observedGroupId === processGroupId,
+      );
+    } catch (cause: unknown) {
+      return {
+        cleaned: false,
+        reason: `process ownership could not be revalidated: ${errorMessage(cause)}`,
+      };
+    }
+    const { failures, validatedMembers } = await processOwnershipFailures(
+      members,
       ownership,
-      liveProcesses(await host.listProcesses()),
       host,
+      expectedIdentities,
       exitSettlement,
     );
-    if ("cleaned" in settled) return settled;
-    escapedProcessGroupIds = settled.escapedProcessGroupIds;
-    const processes = settled.processes;
-    const relationSnapshot = await readProcessRelationSnapshot(
-      ownership,
-      processes,
-      host,
-    );
-    if (relationSnapshot.failures.length > 0)
-      return cleanupValidationFailure(relationSnapshot.failures);
-    members = relationSnapshot.currentRelations.filter(
-      ({ processGroupId: observedGroupId }) =>
-        observedGroupId === processGroupId,
-    );
-  } catch (cause: unknown) {
-    return {
-      cleaned: false,
-      reason: `process ownership could not be revalidated: ${errorMessage(cause)}`,
-    };
+    if (failures.length > 0) return cleanupValidationFailure(failures);
+    if (
+      processGroupId !== ownership.processGroupId &&
+      validatedMembers.length > 0 &&
+      !validatedMembers.some(({ pid }) => pid === processGroupId) &&
+      ownership.sweepTokenOwnedProcesses !== true
+    )
+      return {
+        cleaned: false,
+        reason:
+          "descendant process-group leader identity could not be revalidated",
+      };
+    // Exit of every row in this table does not prove the group is empty. A
+    // same-group child can be forked after the read and during the token
+    // checks, so refresh before skipping the signal.
+    if (validatedMembers.length > 0 || members.length === 0)
+      return {
+        empty: validatedMembers.length === 0,
+        escapedProcessGroupIds: [...escapedProcessGroupIds],
+      };
+    if (refresh >= OWNED_GROUP_REVALIDATION_LIMIT)
+      return {
+        cleaned: false,
+        reason: `owned process group ${String(processGroupId)} members exited during revalidation after ${String(OWNED_GROUP_REVALIDATION_LIMIT)} table refreshes. This release has no runtime override.`,
+      };
   }
-  const { failures, validatedMembers } = await processOwnershipFailures(
-    members,
-    ownership,
-    host,
-    expectedIdentities,
-    exitSettlement,
-  );
-  if (failures.length > 0) return cleanupValidationFailure(failures);
-  if (
-    processGroupId !== ownership.processGroupId &&
-    validatedMembers.length > 0 &&
-    !validatedMembers.some(({ pid }) => pid === processGroupId) &&
-    ownership.sweepTokenOwnedProcesses !== true
-  )
-    return {
-      cleaned: false,
-      reason:
-        "descendant process-group leader identity could not be revalidated",
-    };
-  return { empty: validatedMembers.length === 0, escapedProcessGroupIds };
 };
 
 const cleanupValidationFailure = (

@@ -711,6 +711,78 @@ it("revalidates a group after its observed launcher exits and a child appears", 
   expect(host.signalGroup).toHaveBeenCalledWith(920, "SIGKILL");
 });
 
+it("refreshes a group when its last member exits during revalidation and a child appears", async () => {
+  const launcher: ProcessTableEntry = {
+    pid: 940,
+    parentPid: 1,
+    processGroupId: 940,
+    state: "S",
+    command: "launcher",
+  };
+  const child: ProcessTableEntry = {
+    pid: 941,
+    parentPid: 940,
+    processGroupId: 940,
+    state: "S",
+    command: "child",
+  };
+  let tokenReads = 0;
+  let launcherGone = false;
+  const signalGroup = vi.fn();
+  const host: ProcessOwnershipHost = {
+    platform: "linux",
+    listProcesses: async () => (launcherGone ? [child] : [launcher]),
+    environment: async (pid) => {
+      if (pid === launcher.pid) {
+        tokenReads += 1;
+        // The planning read still sees the launcher. The revalidation read is
+        // the final table, so the child appears only after that snapshot.
+        if (tokenReads >= 2) launcherGone = true;
+        if (launcherGone)
+          throw Object.assign(new Error("opaque exit"), { code: "ESRCH" });
+      }
+      return { REA_PROCESS_RUN_ID: "run" };
+    },
+    processIdentities: async (rows) =>
+      new Map<number, ProcessIdentityObservation>(
+        rows.map(({ pid }) =>
+          pid === launcher.pid && launcherGone
+            ? [
+                pid,
+                {
+                  state: "absent" as const,
+                  reason: "not-found-in-caller-pid-namespace" as const,
+                },
+              ]
+            : [
+                pid,
+                {
+                  state: "readable" as const,
+                  identity: `generation-${pid}`,
+                  lifecycle: {
+                    state: "observed" as const,
+                    lifecycle: "non-zombie" as const,
+                  },
+                  relation: {
+                    state: "observed" as const,
+                    parentPid: pid === child.pid ? launcher.pid : 1,
+                    processGroupId: 940,
+                  },
+                },
+              ],
+        ),
+      ),
+    signalGroup,
+  };
+  expect(
+    await cleanupOwnedProcessGroup(
+      { runId: "run", leaderPid: 940, processGroupId: 940 },
+      host,
+    ),
+  ).toEqual({ cleaned: true, signaled: true });
+  expect(signalGroup).toHaveBeenCalledWith(940, "SIGKILL");
+});
+
 it.each([
   { code: "ESRCH", message: "opaque failure", expected: "absent" },
   {
