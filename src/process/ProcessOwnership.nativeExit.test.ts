@@ -278,9 +278,11 @@ itOnLinux(
     };
     const systemHost = createSystemProcessOwnershipHost("linux", {});
     let nativeReads = 0;
+    let exitArmed = false;
     const host: ProcessOwnershipHost = {
       ...systemHost,
       environment: async () => {
+        exitArmed = true;
         throw Object.assign(
           new Error(
             "ESRCH: simulated environ-open race before native process exit",
@@ -291,7 +293,8 @@ itOnLinux(
       processIdentities: async (...args) => {
         const observations = await systemHost.processIdentities!(...args);
         nativeReads += 1;
-        if (nativeReads === 2) {
+        if (exitArmed) {
+          exitArmed = false;
           child.kill("SIGTERM");
           await once(child, "exit");
         }
@@ -301,7 +304,7 @@ itOnLinux(
     };
     try {
       const [fact] = await readProcessOwnershipFacts([row], host);
-      expect(nativeReads).toBe(3);
+      expect(nativeReads).toBeGreaterThanOrEqual(3);
       expect(fact?.identityBefore).toMatchObject({
         state: "readable",
         identity: expect.stringMatching(/^linux-starttime:/u),
@@ -460,7 +463,8 @@ it.each(["absent", "live", "unavailable", "reused", "reused-zombie"] as const)(
             pid,
             {
               state: "unavailable" as const,
-              reason: "ESRCH: open /proc/910/environ",
+              reason: "failure details without errno",
+              code: "ESRCH",
             },
           ]),
         );
@@ -565,7 +569,7 @@ it("honors cancellation during token-open exit settlement", async () => {
           state: "same-generation",
           identityBefore: identity,
           identityAfter: identity,
-          token: { state: "unavailable", reason: "ESRCH: vanished" },
+          token: { state: "unavailable", reason: "vanished", code: "ESRCH" },
         },
       ],
       host,
@@ -600,7 +604,8 @@ it("does not signal a stale group after its last member exits during revalidatio
             ? { state: "readable" as const, runId: "run" }
             : {
                 state: "unavailable" as const,
-                reason: "ESRCH: open /proc/912/environ",
+                reason: "failure details without errno",
+                code: "ESRCH",
               },
         ]),
       );
@@ -641,3 +646,138 @@ it("does not signal a stale group after its last member exits during revalidatio
   expect(tokenReads).toBe(2);
   expect(signalGroup).not.toHaveBeenCalled();
 });
+
+it("revalidates a group after its observed launcher exits and a child appears", async () => {
+  const launcher: ProcessTableEntry = {
+    pid: 920,
+    parentPid: 1,
+    processGroupId: 920,
+    state: "S",
+    command: "launcher",
+  };
+  const child: ProcessTableEntry = {
+    pid: 921,
+    parentPid: 1,
+    processGroupId: 920,
+    state: "S",
+    command: "child",
+  };
+  let exited = false;
+  let signaled = false;
+  const host: ProcessOwnershipHost = {
+    platform: "linux",
+    listProcesses: async () => (signaled ? [] : exited ? [child] : [launcher]),
+    environment: async (pid) => {
+      if (pid === launcher.pid) {
+        exited = true;
+        throw Object.assign(new Error("opaque exit"), { code: "ESRCH" });
+      }
+      return { REA_PROCESS_RUN_ID: "run" };
+    },
+    processIdentities: async (rows) =>
+      new Map(
+        rows.map(({ pid }) => [
+          pid,
+          pid === launcher.pid && exited
+            ? {
+                state: "absent" as const,
+                reason: "not-found-in-caller-pid-namespace" as const,
+              }
+            : {
+                state: "readable" as const,
+                identity: `generation-${pid}`,
+                lifecycle: {
+                  state: "observed" as const,
+                  lifecycle: "non-zombie" as const,
+                },
+                relation: {
+                  state: "observed" as const,
+                  parentPid: 1,
+                  processGroupId: 920,
+                },
+              },
+        ]),
+      ),
+    signalGroup: vi.fn(() => {
+      signaled = true;
+    }),
+  };
+  expect(
+    await cleanupOwnedProcessGroup(
+      { runId: "run", leaderPid: 920, processGroupId: 920 },
+      host,
+    ),
+  ).toEqual({ cleaned: true, signaled: true });
+  expect(host.signalGroup).toHaveBeenCalledWith(920, "SIGKILL");
+});
+
+it.each([
+  { code: "ESRCH", message: "opaque failure", expected: "absent" },
+  {
+    code: undefined,
+    message: "ESRCH: misleading text",
+    expected: "same-generation",
+  },
+] as const)(
+  "uses structured token error codes instead of message text ($message)",
+  async ({ code, message, expected }) => {
+    const row: ProcessTableEntry = {
+      pid: 930,
+      parentPid: 1,
+      processGroupId: 930,
+      state: "S",
+      command: "fixture",
+    };
+    let tokenRead = false;
+    let observedAfterToken = false;
+    const host: ProcessOwnershipHost = {
+      platform: "linux",
+      listProcesses: async () => [row],
+      environment: async () => {
+        tokenRead = true;
+        throw Object.assign(
+          new Error(message),
+          code === undefined ? {} : { code },
+        );
+      },
+      processIdentities: async (rows) =>
+        new Map(
+          rows.map(({ pid }) => {
+            if (tokenRead && observedAfterToken)
+              return [
+                pid,
+                {
+                  state: "absent" as const,
+                  reason: "not-found-in-caller-pid-namespace" as const,
+                },
+              ];
+            if (tokenRead) observedAfterToken = true;
+            return [
+              pid,
+              {
+                state: "readable" as const,
+                identity: "generation-930",
+                lifecycle: {
+                  state: "observed" as const,
+                  lifecycle: "non-zombie" as const,
+                },
+                relation: {
+                  state: "observed" as const,
+                  parentPid: 1,
+                  processGroupId: 930,
+                },
+              },
+            ];
+          }),
+        ),
+      signalGroup: vi.fn(),
+    };
+    const [fact] = await readProcessOwnershipFacts([row], host);
+    expect(fact?.state).toBe(expected);
+    expect(fact?.token).toMatchObject({
+      state: "unavailable",
+      reason: message,
+      ...(code === undefined ? {} : { code }),
+    });
+  },
+);

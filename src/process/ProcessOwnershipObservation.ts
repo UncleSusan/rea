@@ -844,7 +844,7 @@ export const settleVanishedTokenFacts = async (
     .filter(
       ({ token, identityAfter }) =>
         token.state === "unavailable" &&
-        /^(?:ENOENT|ESRCH):/u.test(token.reason) &&
+        (token.code === "ENOENT" || token.code === "ESRCH") &&
         !processIdentityHasExited(identityAfter),
     )
     .map(({ process }) => process);
@@ -870,7 +870,12 @@ export const settleVanishedTokenFacts = async (
       if (!pendingPids.has(fact.process.pid)) return fact;
       const after = confirmed.get(fact.process.pid);
       if (after?.state === "absent")
-        return { ...fact, state: "absent" as const, identityAfter: after };
+        return {
+          ...fact,
+          state: "absent" as const,
+          identityAfter: after,
+          beforeExitSettlement: fact.beforeExitSettlement ?? fact,
+        };
       const previous = fact.identityAfter;
       if (previous.state !== "readable" || after?.state !== "readable")
         return fact;
@@ -884,7 +889,11 @@ export const settleVanishedTokenFacts = async (
           },
         };
       if (processIdentityHasExited(after))
-        return { ...fact, identityAfter: after };
+        return {
+          ...fact,
+          identityAfter: after,
+          beforeExitSettlement: fact.beforeExitSettlement ?? fact,
+        };
       nextPending.add(fact.process.pid);
       return fact;
     });
@@ -962,7 +971,7 @@ export const readProcessOwnershipFacts = async (
       const token = tokens.get(pid);
       return (
         token?.state === "unavailable" &&
-        /^(?:ENOENT|ESRCH):/u.test(token.reason) &&
+        (token.code === "ENOENT" || token.code === "ESRCH") &&
         observedAfter.get(pid)?.state === "readable"
       );
     });
@@ -1042,7 +1051,7 @@ export const readProcessOwnershipFacts = async (
   };
   const facts = processes.map((process): ProcessOwnershipFact => {
     const after = identityAfter.get(process.pid);
-    const original = finalObservedAfter.get(process.pid);
+    const original = observedAfter.get(process.pid);
     const fact = deriveFact(process, after);
     return after === original
       ? fact

@@ -202,7 +202,11 @@ export interface ProcessOwnershipHost {
 /** Whether one live process exposed its ownership token to the host. */
 export type ProcessRunTokenObservation =
   | { readonly state: "readable"; readonly runId: string | undefined }
-  | { readonly state: "unavailable"; readonly reason: string };
+  | {
+      readonly state: "unavailable";
+      readonly reason: string;
+      readonly code?: string;
+    };
 
 /** Narrow Windows P0 seam for bounded process-tree termination. */
 export interface WindowsProcessTreeHost {
@@ -1069,7 +1073,6 @@ const createOwnedCleanupPlan = async (
       mergeProcessOwnershipFailure(unresolved, failure);
     if (
       failures.length === 0 &&
-      validatedMembers.length > 0 &&
       scanFailures.length === 0 &&
       !unverifiableSampledGroups.has(processGroupId)
     )
